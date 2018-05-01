@@ -5,7 +5,7 @@ pushd "%~dp0"
 
 if not exist "..\.git" goto CheckJediIncNotFound
 
-:: Check if git if available
+:: Check if git is available
 call git --version 2>NUL >NUL
 if ERRORLEVEL 1 goto CannotInitializeSubModules
 :: Initialize git submodules
@@ -60,7 +60,7 @@ build\dcc32ex.exe -Q -B -E..\bin build\JCLCmdStarter.dpr >NUL 2>NUL
 echo.
 echo ===================================================================
 echo Compiling JediInstaller...
-build\dcc32ex.exe %INSTALL_VERBOSE% --runtime-package-rtl --runtime-package-vcl -q -w -dJCLINSTALL -E..\bin -I..\source\include -U..\source\common;..\source\windows JediInstaller.dpr
+build\dcc32ex.exe %INSTALL_VERBOSE% --runtime-package-rtl --runtime-package-vcl -q -dJCLINSTALL -E..\bin -I..\source\include -U..\source\common;..\source\windows JediInstaller.dpr
 if ERRORLEVEL 1 goto FailedCompile
 :: New Delphi versions output "This product doesn't support command line compiling" and then exit with ERRORLEVEL 0
 if not exist ..\bin\JediInstaller.exe goto FailedCompile

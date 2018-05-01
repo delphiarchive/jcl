@@ -222,6 +222,10 @@ function GetTasksList(const List: TStrings): Boolean;
 function ModuleFromAddr(const Addr: Pointer): HMODULE;
 function IsSystemModule(const Module: HMODULE): Boolean;
 
+procedure BeginModuleFromAddrCache;
+procedure EndModuleFromAddrCache;
+function CachedModuleFromAddr(const Addr: Pointer): HMODULE;
+
 function IsMainAppWindow(Wnd: THandle): Boolean;
 function IsWindowResponding(Wnd: THandle; Timeout: Integer): Boolean;
 
@@ -2383,15 +2387,31 @@ end;
 
 {$IFDEF MSWINDOWS}
 function GetRegisteredCompany: string;
+var
+  LastAccessMode: TJclRegWOW64Access;
 begin
   { TODO : check for MSDN documentation }
-  Result := RegReadStringDef(HKEY_LOCAL_MACHINE, REG_CURRENT_VERSION, 'RegisteredOrganization', '');
+  LastAccessMode := RegGetWOW64AccessMode;
+  try
+    RegSetWOW64AccessMode(raNative);
+    Result := RegReadStringDef(HKEY_LOCAL_MACHINE, REG_CURRENT_VERSION, 'RegisteredOrganization', '');
+  finally
+    RegSetWOW64AccessMode(LastAccessMode);
+  end;
 end;
 
 function GetRegisteredOwner: string;
+var
+  LastAccessMode: TJclRegWOW64Access;
 begin
   { TODO : check for MSDN documentation }
-  Result := RegReadStringDef(HKEY_LOCAL_MACHINE, REG_CURRENT_VERSION, 'RegisteredOwner', '');
+  LastAccessMode := RegGetWOW64AccessMode;
+  try
+    RegSetWOW64AccessMode(raNative);
+    Result := RegReadStringDef(HKEY_LOCAL_MACHINE, REG_CURRENT_VERSION, 'RegisteredOwner', '');
+  finally
+    RegSetWOW64AccessMode(LastAccessMode);
+  end;
 end;
 
 { TODO: Check supported platforms, maybe complete rewrite }
@@ -2937,12 +2957,10 @@ function ModuleFromAddr(const Addr: Pointer): HMODULE;
 var
   MI: TMemoryBasicInformation;
 begin
-  MI.AllocationBase := nil;
-  VirtualQuery(Addr, MI, SizeOf(MI));
-  if MI.State <> MEM_COMMIT then
-    Result := 0
+  if (VirtualQuery(Addr, MI, SizeOf(MI)) = SizeOf(MI)) and (MI.State = MEM_COMMIT) then
+    Result := HMODULE(MI.AllocationBase)
   else
-    Result := HMODULE(MI.AllocationBase);
+    Result := 0;
 end;
 
 function IsSystemModule(const Module: HMODULE): Boolean;
@@ -2963,6 +2981,162 @@ begin
       CurModule := CurModule.Next;
     end;
   end;
+end;
+
+
+// Cache for the slow VirtualQuery calls
+//
+// BeginModuleFromAddrCache;
+// try
+//   Module := CachedModuleFromAddr(Address);
+//   ...
+// finally
+//   EndModuleFromAddrCache;
+// end;
+type
+  PModuleAddrSize = ^TModuleAddrSize;
+  TModuleAddrSize = record
+    BaseAddress: TJclAddr;
+    Size: SizeInt;
+    Module: HMODULE;
+  end;
+
+  TModuleAddrSizeList = class(TList)
+  public
+    Counter: Integer;
+    LastAccessIndex: Integer;
+  end;
+
+// The main module (EXE) and the module that contains the JclSysInfo unit can be
+// cached once for all Begin/EndModuleFromAddrCache blocks.
+var
+  MainModuleAddrSize, InstanceModuleAddrSize: TModuleAddrSize;
+
+threadvar
+  ModuleAddrSize: TModuleAddrSizeList;
+
+procedure BeginModuleFromAddrCache;
+const
+  ModuleCodeOffset = $1000;
+var
+  List: TModuleAddrSizeList;
+  MainModule: HMODULE;
+  P: PModuleAddrSize;
+begin
+  List := ModuleAddrSize;
+  if List = nil then
+  begin
+    List := TModuleAddrSizeList.Create;
+    List.Counter := 1;
+    List.LastAccessIndex := -1;
+    ModuleAddrSize := List;
+
+    // Query the module addresses for the main module and JclSysInfo's module and
+    // add them to the list.
+    MainModule := 0;
+    if MainModuleAddrSize.Module = 0 then
+    begin
+      MainModule := GetModuleHandle(nil);
+      CachedModuleFromAddr(Pointer(MainModule + ModuleCodeOffset));
+      if List.Count = 1 then
+      begin
+        // If JclSysInfo is in the main module then we can skip this
+        if MainModule <> HInstance then
+        begin
+          CachedModuleFromAddr(Pointer(HInstance + ModuleCodeOffset));
+          if List.Count = 2 then
+            InstanceModuleAddrSize := PModuleAddrSize(List[1])^;
+        end;
+        MainModuleAddrSize := PModuleAddrSize(List[0])^;
+        List.LastAccessIndex := -1;
+      end;
+    end;
+
+    if (MainModule = 0) and (MainModuleAddrSize.Module <> 0) then
+    begin
+      New(P);
+      P^ := MainModuleAddrSize;
+      List.Add(P);
+      if InstanceModuleAddrSize.Module <> 0 then
+      begin
+        New(P);
+        P^ := InstanceModuleAddrSize;
+        List.Add(P);
+      end;
+    end;
+  end
+  else
+    Inc(List.Counter);
+end;
+
+procedure EndModuleFromAddrCache;
+var
+  List: TModuleAddrSizeList;
+  I: Integer;
+begin
+  List := ModuleAddrSize;
+  if List <> nil then
+  begin
+    Dec(List.Counter);
+    if List.Counter = 0 then
+    begin
+      for I := 0 to List.Count - 1 do
+        Dispose(PModuleAddrSize(List[I]));
+      List.Free;
+      ModuleAddrSize := nil;
+    end;
+  end;
+end;
+
+function CachedModuleFromAddr(const Addr: Pointer): HMODULE;
+var
+  P: PModuleAddrSize;
+  List: TModuleAddrSizeList;
+  I, LastAccessIndex: Integer;
+  MI: TMemoryBasicInformation;
+begin
+  List := ModuleAddrSize;
+  if List = nil then
+  begin
+    Result := ModuleFromAddr(Addr);
+    Exit;
+  end;
+
+  LastAccessIndex := List.LastAccessIndex;
+  if LastAccessIndex <> -1 then
+  begin
+    P := List[LastAccessIndex];
+    if (P.BaseAddress <= TJclAddr(Addr)) and
+       (TJclAddr(Addr) < P.BaseAddress + TJclAddr(P.Size)) then
+    begin
+      Result := P.Module;
+      Exit;
+    end;
+  end;
+
+  for I := 0 to List.Count - 1 do
+  begin
+    P := List[I];
+    if (P.BaseAddress <= TJclAddr(Addr)) and
+       (TJclAddr(Addr) < P.BaseAddress + TJclAddr(P.Size)) then
+    begin
+      List.LastAccessIndex := I;
+      Result := P.Module;
+      Exit;
+    end;
+  end;
+
+  if (VirtualQuery(Addr, MI, SizeOf(MI)) = SizeOf(MI)) and (MI.State = MEM_COMMIT) then
+  begin
+    New(P);
+    P.Module := HMODULE(MI.AllocationBase);
+    P.BaseAddress := TJclAddr(MI.BaseAddress);
+    P.Size := MI.RegionSize;
+    List.LastAccessIndex := List.Add(P);
+    Result := HMODULE(MI.AllocationBase);
+  end
+  else
+    Result := 0;
 end;
 
 // Reference: http://msdn.microsoft.com/library/periodic/period97/win321197.htm
@@ -3931,7 +4105,7 @@ end;
 function GetWindowsVersionNumber: string;
 begin
   // Returns version number as MajorVersionNumber.MinorVersionNumber (string type)
-  Result := IntToStr(GetWindowsMajorVersionNumber) + '.' + IntToStr(GetWindowsMinorVersionNumber);
+  Result := Format('%d.%d', [GetWindowsMajorVersionNumber, GetWindowsMinorVersionNumber]);
 end;
 
 function GetWindowsServicePackVersion: Integer;
@@ -3969,10 +4143,10 @@ end;
 
 function GetWindows10ReleaseId: Integer;
 begin
-if IsWin10 then
-  Result := StrToInt(RegReadStringDef(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows NT\CurrentVersion', 'ReleaseId', '0'))
-else
-  Result := -1;
+  if IsWin10 then
+    Result := StrToIntDef(RegReadStringDef(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows NT\CurrentVersion', 'ReleaseId', '0'), -1)
+  else
+    Result := -1;
 end;
 
 function GetWindows10ReleaseName: String;
@@ -3986,6 +4160,10 @@ begin
           Result := 'Windows 10 November Update';
        1607:
           Result := 'Windows 10 Anniversary Update';
+       1703:
+          Result := 'Windows 10 Creators Update';
+       1709:
+          Result := 'Windows 10 Fall Creators Update';
     else
       Result := '';
     end;
@@ -4005,6 +4183,10 @@ begin
           Result := 'Threshold 2';
        1607:
           Result := 'Redstone 1';
+       1703:
+          Result := 'Redstone 2';
+       1709:
+          Result := 'Redstone 3';
     else
       Result := '';
     end;
@@ -4253,13 +4435,20 @@ begin
     GetSystemInfo(SystemInfo);
 end;
 
+var
+  CachedGetProcessorArchitecture: DWORD = DWORD(-1);
+
 function GetProcessorArchitecture: TProcessorArchitecture;
 var
   ASystemInfo: TSystemInfo;
 begin
-  ASystemInfo.dwOemId := 0;
-  GetNativeSystemInfo(ASystemInfo);
-  case ASystemInfo.wProcessorArchitecture of
+  if CachedGetProcessorArchitecture = DWORD(-1) then
+  begin
+    ASystemInfo.dwOemId := 0;
+    GetNativeSystemInfo(ASystemInfo);
+    CachedGetProcessorArchitecture := ASystemInfo.wProcessorArchitecture;
+  end;
+  case CachedGetProcessorArchitecture of
     PROCESSOR_ARCHITECTURE_INTEL:
       Result := pax8632;
     PROCESSOR_ARCHITECTURE_IA64:
@@ -4272,12 +4461,8 @@ begin
 end;
 
 function IsWindows64: Boolean;
-var
-  ASystemInfo: TSystemInfo;
 begin
-  ASystemInfo.dwOemId := 0;
-  GetNativeSystemInfo(ASystemInfo);
-  Result := ASystemInfo.wProcessorArchitecture in [PROCESSOR_ARCHITECTURE_IA64,PROCESSOR_ARCHITECTURE_AMD64];
+  Result := GetProcessorArchitecture in [paIA64, pax8664];
 end;
 
 function JclCheckWinVersion(Major, Minor: Integer): Boolean;
